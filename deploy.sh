@@ -1,109 +1,108 @@
 #!/usr/bin/env bash
 #
-# Build WonderPark Tycoon and publish it to the local Apache docroot.
+# Build WonderPark Tycoon locally and ship the bundle to the web server.
 #
-# Run this ON the EC2 instance, as ec2-user, from a clone of this repo:
+# Run this on your WORKSTATION, not on the server. The target instance is
+# Amazon Linux 2 (glibc 2.26), which cannot run the Node 20+ that Vite 8
+# requires — official Node builds need glibc 2.28+. Building here and copying
+# the result sidesteps that entirely: the server only ever serves static files.
 #
-#   ./deploy.sh                      # pull, build, publish, reload httpd
-#   ./deploy.sh --no-pull            # publish the working tree as-is
-#   DOCROOT=/var/www/html/foo ./deploy.sh
+# Requires locally: node 20.19+/22.12+, npm, ssh, scp.
+# Requires on the server: nothing. No Node, no npm, no build tools.
 #
-# Do NOT run the whole script as root: npm would build as root and leave
-# root-owned files in the clone. The handful of privileged steps use sudo
-# individually.
-
+# Configure by copying deploy/deploy.env.example to deploy/deploy.env and
+# editing it, or by setting the same variables in the environment:
+#
+#   ./deploy.sh                 # build and ship
+#   ./deploy.sh --no-build      # ship whatever is already in dist/
+#
 set -euo pipefail
 
-DOCROOT="${DOCROOT:-/var/www/html/park}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONF_SRC="$REPO_DIR/deploy/park.conf"
-CONF_DEST="/etc/httpd/conf.d/park.conf"
-PULL=1
-[ "${1:-}" = "--no-pull" ] && PULL=0
+ENV_FILE="$REPO_DIR/deploy/deploy.env"
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 step() { printf '\n\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 
+# shellcheck source=/dev/null
+[ -f "$ENV_FILE" ] && . "$ENV_FILE"
+
+PARK_USER="${PARK_USER:-ec2-user}"
+PARK_HOST="${PARK_HOST:-}"
+PARK_REMOTE="${PARK_REMOTE:-}"
+PARK_KEY="${PARK_KEY:-}"
+PARK_URL="${PARK_URL:-}"
+BUILD=1
+[ "${1:-}" = "--no-build" ] && BUILD=0
+
 # ---------------------------------------------------------------- checks ---
-# The publish step clears $DOCROOT/assets, so refuse to point at a directory
-# that is shared with anything else.
-case "$DOCROOT" in
-  ""|"/"|/var/www|/var/www/html)
-    die "DOCROOT='$DOCROOT' is a shared or root path. Use a dedicated subdirectory." ;;
+[ -n "$PARK_HOST" ]   || die "PARK_HOST is not set. Copy deploy/deploy.env.example to deploy/deploy.env."
+[ -n "$PARK_REMOTE" ] || die "PARK_REMOTE is not set (the directory Apache serves the game from)."
+
+# The publish step clears \$PARK_REMOTE/assets, so refuse a path shared with
+# anything else.
+case "$PARK_REMOTE" in
+  ""|"/"|/var/www|/var/www/html|/data/var/www/html)
+    die "PARK_REMOTE='$PARK_REMOTE' is a shared or root path. Use a dedicated subdirectory." ;;
   /*) ;;
-  *) die "DOCROOT must be an absolute path (got '$DOCROOT')." ;;
+  *) die "PARK_REMOTE must be an absolute path (got '$PARK_REMOTE')." ;;
 esac
 
-[ -f "$CONF_SRC" ] || die "missing $CONF_SRC — run this from inside the repo clone."
+SSH_OPTS=()
+[ -n "$PARK_KEY" ] && SSH_OPTS=(-i "$PARK_KEY")
+TARGET="$PARK_USER@$PARK_HOST"
 
-command -v node >/dev/null \
-  || die "node not found. Install it (sudo dnf install -y nodejs22) or use nvm."
-NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
-[ "$NODE_MAJOR" -ge 20 ] \
-  || die "Node $(node -v) is too old — Vite 8 needs Node 20.19+ or 22.12+."
+# ----------------------------------------------------------------- build ---
+if [ "$BUILD" -eq 1 ]; then
+  command -v node >/dev/null || die "node not found."
+  NODE_MAJOR="$(node -p 'process.versions.node.split(".")[0]')"
+  [ "$NODE_MAJOR" -ge 20 ] || die "Node $(node -v) is too old — Vite 8 needs 20.19+ or 22.12+."
 
-systemctl is-active --quiet httpd || warn "httpd is not running (systemctl status httpd)."
-
-# park.conf uses directives from these three modules. Apache refuses to start on
-# an unknown directive, so check before installing rather than after.
-step "Checking Apache modules"
-missing=""
-for m in deflate_module expires_module headers_module; do
-  sudo httpd -M 2>/dev/null | grep -q "$m" || missing="$missing ${m%_module}"
-done
-[ -z "$missing" ] \
-  && echo "deflate, expires, headers: present" \
-  || die "httpd is missing mod:$missing — enable them in /etc/httpd/conf.modules.d/ and retry."
-
-# ---------------------------------------------------------------- build ----
-if [ "$PULL" -eq 1 ]; then
-  step "Pulling latest"
-  git -C "$REPO_DIR" pull --ff-only
+  step "Building with Node $(node -v)"
+  (cd "$REPO_DIR" && npm ci && npm run build)
 fi
+[ -f "$REPO_DIR/dist/index.html" ] || die "no dist/index.html — build first (drop --no-build)."
 
-step "Installing dependencies"
-# Playwright is a devDependency worth a few hundred MB and is only used by the
-# smoke/soak scripts; the build needs nothing but three and vite.
-npm ci --omit=dev
+# ------------------------------------------------------------------ ship ---
+STAGING="/tmp/park-$(date +%Y%m%d-%H%M%S)-$$"
 
-step "Building"
-npm run build
-[ -f "$REPO_DIR/dist/index.html" ] || die "build produced no dist/index.html"
+step "Copying bundle to $TARGET:$STAGING"
+ssh "${SSH_OPTS[@]}" "$TARGET" "mkdir -p '$STAGING'"
+scp "${SSH_OPTS[@]}" -q -r "$REPO_DIR"/dist/* "$TARGET:$STAGING/"
 
-# -------------------------------------------------------------- publish ----
-step "Publishing to $DOCROOT"
-sudo mkdir -p "$DOCROOT"
-# Old hashed bundles would otherwise accumulate forever. Only the assets
-# directory we own is cleared; anything else under $DOCROOT is left alone.
-sudo rm -rf "${DOCROOT:?}/assets"
-# cp (unlike mv) lets new files inherit the destination's SELinux label;
-# restorecon is belt-and-braces for anything that slipped through.
-sudo cp -r "$REPO_DIR/dist/." "$DOCROOT/"
-if command -v restorecon >/dev/null; then sudo restorecon -R "$DOCROOT"; fi
+step "Installing into $PARK_REMOTE"
+# Quoted heredoc: this runs verbatim on the server, nothing expands locally,
+# so the paths are injected deliberately via the two assignments below.
+ssh "${SSH_OPTS[@]}" "$TARGET" bash -s <<REMOTE
+set -euo pipefail
+remote='$PARK_REMOTE'
+staging='$STAGING'
 
-step "Installing Apache config"
-tmp_conf="$(mktemp)"
-trap 'rm -f "$tmp_conf"' EXIT
-sed "s#/var/www/html/park#$DOCROOT#g" "$CONF_SRC" > "$tmp_conf"
-if sudo cmp -s "$tmp_conf" "$CONF_DEST" 2>/dev/null; then
-  echo "unchanged — no reload needed"
+sudo mkdir -p "\$remote"
+# Old content-hashed bundles would otherwise accumulate forever. Only the
+# assets directory this app owns is cleared; anything else is left alone.
+sudo rm -rf "\${remote:?}/assets"
+# cp (unlike mv) lets new files inherit the destination's SELinux label.
+sudo cp -r "\$staging/." "\$remote/"
+if command -v restorecon >/dev/null 2>&1; then sudo restorecon -R "\$remote"; fi
+rm -rf "\$staging"
+echo "installed \$(find "\$remote" -type f | wc -l) files"
+REMOTE
+
+# No httpd reload: static files are read per-request. A reload is only needed
+# when deploy/park.conf itself changes, which this script does not touch.
+
+# ---------------------------------------------------------------- verify ---
+if [ -n "$PARK_URL" ]; then
+  step "Verifying $PARK_URL"
+  code="$(curl -fsS -o /dev/null -w '%{http_code}' "$PARK_URL" || true)"
+  if [ "$code" = "200" ]; then
+    echo "200 OK — $PARK_URL"
+  else
+    warn "got '${code:-no response}'. Check the Alias/vhost for $PARK_REMOTE and sudo tail /var/log/httpd/error_log"
+  fi
 else
-  sudo cp "$tmp_conf" "$CONF_DEST"
-  sudo chmod 644 "$CONF_DEST"
-  sudo apachectl configtest
-  sudo systemctl reload httpd
-  echo "installed and reloaded"
-fi
-
-# --------------------------------------------------------------- verify ----
-url_path="/${DOCROOT#/var/www/html/}"
-step "Verifying"
-code="$(curl -fsS -o /dev/null -w '%{http_code}' "http://localhost${url_path}/" || true)"
-if [ "$code" = "200" ]; then
-  echo "http://localhost${url_path}/ -> 200 OK"
-  echo
-  echo "Live at: http://$(curl -fsS --max-time 2 ifconfig.me || echo '<public-ip>')${url_path}/"
-else
-  warn "local request returned '${code:-no response}' — check: sudo tail /var/log/httpd/error_log"
+  step "Done"
+  echo "Set PARK_URL in deploy/deploy.env to have the script verify the result."
 fi

@@ -4,3 +4,6 @@ scripts/shots
 .DS_Store
 *.log
 .vite
+
+# Local deploy settings (hostname, key path).
+deploy/deploy.env
